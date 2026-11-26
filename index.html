@@ -22,6 +22,18 @@
     font-size:clamp(11px,1.1vw,12px);letter-spacing:.26em;text-indent:.26em;color:rgba(255,255,255,.48)}
   .tag{position:fixed;top:max(18px,env(safe-area-inset-top));left:22px;font-family:system-ui,sans-serif;
     font-size:11px;letter-spacing:.3em;color:rgba(255,255,255,.32);pointer-events:none}
+  .gbtn{position:fixed;right:16px;bottom:max(18px,env(safe-area-inset-bottom));z-index:3;
+    display:inline-flex;align-items:center;gap:7px;padding:9px 15px;border-radius:999px;cursor:pointer;
+    border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.055);color:rgba(255,255,255,.82);
+    -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+    font-family:system-ui,-apple-system,"PingFang SC",sans-serif;font-size:12.5px;letter-spacing:.06em;
+    transition:background .2s,border-color .2s,transform .15s}
+  .gbtn:hover{background:rgba(255,255,255,.12);border-color:rgba(255,255,255,.3)}
+  .gbtn:active{transform:scale(.97)}
+  .gbtn.on{border-color:rgba(120,255,200,.45);color:#cbffe9;box-shadow:0 0 18px rgba(90,240,190,.22)}
+  .gstatus{position:fixed;right:16px;bottom:calc(max(18px,env(safe-area-inset-bottom)) + 46px);z-index:3;
+    font-family:system-ui,-apple-system,"PingFang SC",sans-serif;font-size:11px;line-height:1.5;
+    color:rgba(255,255,255,.42);text-align:right;max-width:230px;pointer-events:none}
 </style>
 </head>
 <body>
@@ -29,8 +41,10 @@
 <div class="tag" id="tag">V17.6 · 经典</div>
 <div class="ui">
   <h1>Merry Christmas</h1>
-  <p>拖动旋转 · 双击换配色</p>
+  <p>拖动旋转 · 双击换色 · 手势控制</p>
 </div>
+<button id="gesture" class="gbtn" type="button">✋ 开启手势</button>
+<div id="gStatus" class="gstatus"></div>
 <script>
 (function () {
   'use strict';
@@ -223,6 +237,162 @@
     rt = setTimeout(layout, 140);
   });
 
+  // ---------- 手势捕捉（摄像头） ----------
+  var gBtn = document.getElementById('gesture');
+  var gStatus = document.getElementById('gStatus');
+  var gCanvas = document.createElement('canvas');
+  gCanvas.width = 96; gCanvas.height = 72;
+  var gctx = gCanvas.getContext('2d', { willReadFrequently: true });
+  var video = document.createElement('video');
+  video.setAttribute('playsinline', 'playsinline');
+  video.muted = true;
+  var gStream = null, gActive = false;
+  var handRaw = null, handSm = null, lastHandAt = 0, lastScan = 0;
+  var isFist = false, fistSince = 0, grab = false, lastStatus = '';
+
+  function rr(c, x, y, w, h, r) {
+    c.beginPath();
+    c.moveTo(x + r, y);
+    c.arcTo(x + w, y, x + w, y + h, r);
+    c.arcTo(x + w, y + h, x, y + h, r);
+    c.arcTo(x, y + h, x, y, r);
+    c.arcTo(x, y, x + w, y, r);
+    c.closePath();
+  }
+
+  function startGesture() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      gStatus.textContent = '此浏览器不支持摄像头（需 https 或 localhost）';
+      return;
+    }
+    gStatus.textContent = '正在请求摄像头权限…';
+    navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' }, audio: false })
+      .then(function (s) {
+        gStream = s;
+        video.srcObject = s;
+        return video.play();
+      })
+      .then(function () {
+        gActive = true;
+        gBtn.classList.add('on');
+        gBtn.textContent = '✋ 关闭手势';
+        gStatus.textContent = '把手放进画面右下角的小窗';
+      })
+      .catch(function (err) {
+        gActive = false;
+        gBtn.classList.remove('on');
+        gBtn.textContent = '✋ 开启手势';
+        gStatus.textContent = err && err.name === 'NotAllowedError' ? '摄像头权限被拒绝，可在浏览器地址栏重新允许' : '摄像头打不开，可能没有可用设备';
+      });
+  }
+
+  function stopGesture() {
+    gActive = false; grab = false; isFist = false;
+    handRaw = null; handSm = null;
+    if (gStream) { gStream.getTracks().forEach(function (t) { t.stop(); }); gStream = null; }
+    video.srcObject = null;
+    gBtn.classList.remove('on');
+    gBtn.textContent = '✋ 开启手势';
+    gStatus.textContent = '';
+  }
+
+  gBtn.addEventListener('click', function () { if (gActive) stopGesture(); else startGesture(); });
+
+  function isSkin(r, g, b) {
+    var mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+    var Y = 0.299 * r + 0.587 * g + 0.114 * b;
+    var Cr = (r - Y) * 0.713 + 128, Cb = (b - Y) * 0.564 + 128;
+    if (Cr >= 132 && Cr <= 176 && Cb >= 76 && Cb <= 130 && Y > 35) return true;
+    return r > 75 && g > 32 && b > 16 && r > g && r > b && (r - b) > 12 && (mx - mn) > 14;
+  }
+
+  // 找手：统计肤色像素的质心、包围盒，用「填充率」区分张开手掌与握拳
+  function scanHand(now) {
+    if (!gActive || video.readyState < 2) return;
+    if (now - lastScan < 50) return;
+    lastScan = now;
+    try { gctx.drawImage(video, 0, 0, 96, 72); } catch (e) { return; }
+    var d = gctx.getImageData(0, 0, 96, 72).data;
+    var sx = 0, sy = 0, n = 0, minX = 96, maxX = -1, minY = 72, maxY = -1;
+    for (var y = 0; y < 72; y++) {
+      for (var x = 0; x < 96; x++) {
+        var i = (y * 96 + x) * 4;
+        if (!isSkin(d[i], d[i + 1], d[i + 2])) continue;
+        sx += x; sy += y; n++;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+    if (n < 70) { handRaw = null; return; }
+    var bw = maxX - minX + 1, bh = maxY - minY + 1;
+    handRaw = { x: (sx / n) / 96, y: (sy / n) / 72, extent: n / (bw * bh), area: n / 6912 };
+    lastHandAt = now;
+  }
+
+  function applyGesture(now, dt) {
+    if (!gActive) return;
+    scanHand(now);
+
+    if (handRaw) {
+      if (handSm) {
+        handSm.x += (handRaw.x - handSm.x) * 0.3;
+        handSm.y += (handRaw.y - handSm.y) * 0.3;
+        handSm.extent += (handRaw.extent - handSm.extent) * 0.25;
+      } else {
+        handSm = { x: handRaw.x, y: handRaw.y, extent: handRaw.extent };
+      }
+      if (!isFist && handSm.extent > 0.60) {          // 握拳 → 抓住
+        isFist = true; grab = true; fistSince = now;
+        velY = 0;
+      } else if (isFist && handSm.extent < 0.52) {    // 张开 → 放手，并换配色
+        isFist = false; grab = false;
+        if (now - fistSince > 250) nextTheme();
+      }
+    } else if (now - lastHandAt > 450) {
+      handSm = null; grab = false; isFist = false;
+    }
+
+    var st = handSm ? (grab ? '已抓住 · 张开手继续' : '跟随中 · 手左右移动旋转') : '寻找手…';
+    if (st !== lastStatus) { lastStatus = st; gStatus.textContent = st; }
+  }
+
+  function drawHUD() {
+    if (!gActive || video.readyState < 2) return;
+    var w = Math.max(104, Math.min(200, W * 0.24));
+    var h = w * 0.75;
+    var x = W - w - 16, y = H - h - (W < 560 ? 108 : 92);
+
+    ctx.save();
+    rr(ctx, x, y, w, h, 10);
+    ctx.clip();
+    ctx.translate(x + w, y);
+    ctx.scale(-1, 1);
+    ctx.drawImage(video, 0, 0, w, h);
+    ctx.restore();
+
+    if (handSm) {
+      var mx = x + (1 - handSm.x) * w, my = y + handSm.y * h;
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      var col = grab ? 'rgba(255,196,120,.95)' : 'rgba(130,255,205,.95)';
+      ctx.strokeStyle = col;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(mx, my, 10, 0, 6.2832); ctx.stroke();
+      ctx.fillStyle = col;
+      ctx.beginPath(); ctx.arc(mx, my, 2.2, 0, 6.2832); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.strokeStyle = 'rgba(255,255,255,.16)';
+    ctx.lineWidth = 1;
+    rr(ctx, x + 0.5, y + 0.5, w - 1, h - 1, 10);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // ---------- 绘制 ----------
   function scenePoint(x, y, z) {
     var x1 = x * cosY - z * sinY;
@@ -389,10 +559,21 @@
     var dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 
+    applyGesture(now, dt);
+
     if (!dragging) {
-      rotY += (spin + velY) * dt;
-      velY *= Math.pow(0.015, dt);
-      if (Math.abs(velY) < 0.002) velY = 0;
+      if (gActive && handSm && !grab) {
+        // 手势跟随：手的左右位置 → 角速度；上下位置 → 俯仰
+        var gv = (handSm.x - 0.5) * 2.2;
+        if (Math.abs(handSm.x - 0.5) < 0.055) gv = 0;
+        rotY += gv * dt;
+        rotX += ((0.5 - handSm.y) * 0.5 - rotX) * Math.min(1, dt * 3.2);
+        velY *= Math.pow(0.02, dt);
+      } else if (!(gActive && handSm && grab)) {
+        rotY += (spin + velY) * dt;
+        velY *= Math.pow(0.015, dt);
+        if (Math.abs(velY) < 0.002) velY = 0;
+      }
     }
 
     cosY = Math.cos(rotY); sinY = Math.sin(rotY);
@@ -403,6 +584,7 @@
     drawTree(now);
     drawStar(now);
     drawSnow(now, dt);
+    drawHUD();
 
     requestAnimationFrame(frame);
   }
